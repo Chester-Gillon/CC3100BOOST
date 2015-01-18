@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <inc/hw_memmap.h>
+#include <inc/hw_uart.h>
+#include <inc/hw_ints.h>
 #include <driverlib/pin_map.h>
 #include <driverlib/sysctl.h>
 #include <driverlib/fpu.h>
@@ -20,6 +22,7 @@
 #include <driverlib/rom_map.h>
 #include <driverlib/cpu.h>
 #include <driverlib/systick.h>
+#include <driverlib/interrupt.h>
 #include <usblib/usblib.h>
 #include <usblib/usbcdc.h>
 #include <usblib/device/usbdevice.h>
@@ -86,6 +89,76 @@ void sys_tick_handler (void)
         {
             nHIB_timer_ms--;
         }
+    }
+}
+
+/**
+ * @brief Read as many characters from the UART FIFO as we can and move them into the CDC transmit buffer.
+ * @return Returns UART error flags read during receiption
+ */
+static uint32_t read_uart_data (void)
+{
+    uint32_t usb_available_space;
+    uint32_t rx_error_flags;
+    int32_t rx_data;
+    uint8_t rx_character;
+    uint32_t num_written;
+
+    /* Find the available space to store characters in the USB buffer*/
+    usb_available_space = USBBufferSpaceAvailable (&cdc_tx_buffer);
+
+    /* Read data from the UART FIFO until there is none left or we run out of space in our receive buffer. */
+    rx_error_flags = 0;
+    while ((usb_available_space > 0) && UARTCharsAvail (UART1_BASE))
+    {
+        rx_data = UARTCharGetNonBlocking (UART1_BASE);
+
+        if ((rx_data & UART_DR_DATA_M) == 0)
+        {
+            /* The character didn't contain any error notifications, so copy it to the output buffer */
+            rx_character = (uint8_t) rx_data;
+            num_written = USBBufferWrite (&cdc_tx_buffer, &rx_character, 1);
+            check_assert (num_written == 1);
+            usb_available_space--;
+        }
+        else
+        {
+            /* Update our error accumulator. */
+            rx_error_flags |= rx_data;
+        }
+    }
+
+    return rx_error_flags;
+}
+
+/**
+ * @brief UART interrupt handler, to handle re-direction between USB and the CC3100BOOST
+ */
+void uart_interrupt_handler (void)
+{
+    uint32_t active_interrupts;
+    uint32_t rx_error_flags;
+
+    /* Get and clear the current interrupt source(s) */
+    active_interrupts = UARTIntStatus (UART1_BASE, true);
+    UARTIntClear (UART1_BASE, active_interrupts);
+
+    /* Are we being interrupted because the UART TX FIFO has space available */
+    if (active_interrupts & UART_INT_TX)
+    {
+        /* If the output buffer is empty, turn off the transmit interrupt. */
+        if(USBBufferDataAvailable (&cdc_rx_buffer) == 0)
+        {
+            UARTIntDisable (UART1_BASE, UART_INT_TX);
+        }
+    }
+
+    /* Handle receive interrupts */
+    if (active_interrupts & (UART_INT_OE | UART_INT_BE | UART_INT_PE |
+                             UART_INT_FE | UART_INT_RT | UART_INT_RX))
+    {
+        /* Read the UART's characters into the buffer. */
+        rx_error_flags = read_uart_data ();
     }
 }
 
@@ -404,9 +477,15 @@ int main (void)
     /* Set default UART configuration */
     UARTConfigSetExpClk (UART1_BASE, MAP_SysCtlClockGet(), 115200,
                          UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE);
+    UARTFIFOLevelSet (UART1_BASE, UART_FIFO_TX4_8, UART_FIFO_RX4_8);
 
     /* Enable hardware flow control (not sure if the CC3100BOOST uses it) */
     UARTFlowControlSet (UART1_BASE, UART_FLOWCONTROL_TX);
+
+    /* Configure and enable UART interrupts. */
+    UARTIntClear (UART1_BASE, UARTIntStatus (UART1_BASE, false));
+    UARTIntEnable (UART1_BASE, (UART_INT_OE | UART_INT_BE | UART_INT_PE |
+                                UART_INT_FE | UART_INT_RT | UART_INT_TX | UART_INT_RX));
 
     /* Configure the GPIO pin for controlling the CC3100BOOST nHIB, initially not asserted */
     SysCtlPeripheralEnable (SYSCTL_PERIPH_GPIOE);
@@ -434,6 +513,9 @@ int main (void)
 
     /* Pass our device information to the USB library and place the device on the bus. */
     check_assert (USBDCDCInit(0, &CDC_device) != NULL);
+
+    /* Enable UART interrupts now that the application is ready to start. */
+    IntEnable (INT_UART1);
 
     /* Sleep, as all work is triggered from interrupt handlers */
     for (;;)
