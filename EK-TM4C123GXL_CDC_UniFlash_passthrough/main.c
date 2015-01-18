@@ -18,12 +18,22 @@
 #include <driverlib/uart.h>
 #include <driverlib/rom.h>
 #include <driverlib/rom_map.h>
+#include <driverlib/cpu.h>
+#include <driverlib/systick.h>
 #include <usblib/usblib.h>
 #include <usblib/usbcdc.h>
 #include <usblib/device/usbdevice.h>
 #include <usblib/device/usbdcdc.h>
 
 #include "usb_serial_structs.h"
+
+/** When true the nHIB has been asserted following the break being asserted.
+ *  When the timer expires the nHIB is de-asserted.
+ */
+static volatile bool nHIB_timer_running;
+
+/** Millisecond count-down for timing now long to assert nHIB */
+static volatile uint32_t nHIB_timer_ms;
 
 /**
  * @brief If a program assertion fails, light only the red LED and halt
@@ -58,6 +68,25 @@ static void deassert_nHIB (void)
 static void assert_nHIB (void)
 {
     GPIOPinWrite (GPIO_PORTE_BASE, GPIO_PIN_4, 0);
+}
+
+/**
+ * @brief Interrupt handler for Sys Tick which de-asserts nHIB after the timer expires
+ */
+void sys_tick_handler (void)
+{
+    if (nHIB_timer_running)
+    {
+        if (nHIB_timer_ms == 0)
+        {
+            nHIB_timer_running = false;
+            deassert_nHIB ();
+        }
+        else
+        {
+            nHIB_timer_ms--;
+        }
+    }
 }
 
 /**
@@ -255,6 +284,22 @@ static void set_line_coding (const tLineCoding *const line_coding)
 }
 
 /**
+ * @brief Set the UART RTS state to the requested value
+ * @param[in] line_state The requested control line state, in CDC format
+ */
+static void set_control_line_state (const uint32_t line_state)
+{
+    if (line_state & USB_CDC_ACTIVATE_CARRIER)
+    {
+        UARTModemControlSet (UART1_BASE, UART_OUTPUT_RTS);
+    }
+    else
+    {
+        UARTModemControlClear (UART1_BASE, UART_OUTPUT_RTS);
+    }
+}
+
+/**
  * @brief Set the break state on the UART connected to the CC3100BOOST
  * @param[in] break_state If true assert break.
  */
@@ -293,8 +338,8 @@ uint32_t cdc_control_handler(void *pvCBData, uint32_t ui32Event,
         break;
 
     case USBD_CDC_EVENT_SET_CONTROL_LINE_STATE:
-        /* Request to set the contline state is ignored as the UART hardware is
-         * configured to set the RTS output based upon if there is free space in the receive FIFO */
+        /* Set the requested modem control line state */
+        set_control_line_state (ui32MsgValue);
         break;
 
     case USBD_CDC_EVENT_SET_LINE_CODING:
@@ -304,17 +349,21 @@ uint32_t cdc_control_handler(void *pvCBData, uint32_t ui32Event,
 
     case USBD_CDC_EVENT_SEND_BREAK:
         /* Send a break condition on the serial line.
-         * The CC3100BOOST nHIB is asserted during the break. */
-        assert_nHIB ();
+         * The CC3100BOOST nHIB is asserted for 100ms.
+         * The de-assertion of nHIB triggers the CC3100BOOST to communicate with UniFlash. */
         send_break (true);
+        assert_nHIB ();
+        nHIB_timer_ms = 100;
+        nHIB_timer_running = true;
         break;
 
     case USBD_CDC_EVENT_CLEAR_BREAK:
         /* Clear the break condition on the serial line.
-         * The CC3100BOOST nHIB is de-asserted after the break has been cleared,
-         * which triggers the CC3100BOOST to communicate with UniFlash. */
+         * Ensure nHIB is de-asserted (this should not be necessary as UniFlash
+         * only seems to clear the break condition after communication has been established) */
         send_break (false);
         deassert_nHIB ();
+        nHIB_timer_running = false;
         break;
 
     default:
@@ -356,8 +405,8 @@ int main (void)
     UARTConfigSetExpClk (UART1_BASE, MAP_SysCtlClockGet(), 115200,
                          UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE);
 
-    /* Hardware flow control is enabled - not sure if the CC3100BOOST uses it */
-    UARTFlowControlSet (UART1_BASE, UART_FLOWCONTROL_TX | UART_FLOWCONTROL_RX);
+    /* Enable hardware flow control (not sure if the CC3100BOOST uses it) */
+    UARTFlowControlSet (UART1_BASE, UART_FLOWCONTROL_TX);
 
     /* Configure the GPIO pin for controlling the CC3100BOOST nHIB, initially not asserted */
     SysCtlPeripheralEnable (SYSCTL_PERIPH_GPIOE);
@@ -368,6 +417,11 @@ int main (void)
     SysCtlPeripheralEnable (SYSCTL_PERIPH_GPIOF);
     GPIOPinTypeGPIOOutput (GPIO_PORTF_BASE, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3);
     GPIOPinWrite (GPIO_PORTF_BASE, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3, 0);
+
+    /* Set Sys Tick to generate a 1 millisecond tick */
+    SysTickPeriodSet (MAP_SysCtlClockGet() / 1000);
+    SysTickEnable ();
+    SysTickIntEnable ();
 
     /* Initialize the transmit and receive buffers. */
     check_assert (USBBufferInit (&cdc_tx_buffer) != NULL);
@@ -381,9 +435,10 @@ int main (void)
     /* Pass our device information to the USB library and place the device on the bus. */
     check_assert (USBDCDCInit(0, &CDC_device) != NULL);
 
+    /* Sleep, as all work is triggered from interrupt handlers */
     for (;;)
     {
-        /* @todo stub */
+        CPUwfi ();
     }
 
     return 0;
