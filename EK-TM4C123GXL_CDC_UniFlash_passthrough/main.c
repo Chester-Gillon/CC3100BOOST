@@ -191,7 +191,17 @@ uint32_t cdc_rx_handler(void *pvCBData, uint32_t ui32Event,
 uint32_t cdc_tx_handler(void *pvCBData, uint32_t ui32Event,
                         uint32_t ui32MsgValue, void *pvMsgData)
 {
-    check_assert (false); /* @todo stub */
+    switch (ui32Event)
+    {
+    case USB_EVENT_TX_COMPLETE:
+        /* Since we are using the USBBuffer, we don't need to do anything here. */
+        break;
+
+    default:
+        check_assert (false);
+        break;
+    }
+
     return 0;
 }
 
